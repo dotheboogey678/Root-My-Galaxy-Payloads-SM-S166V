@@ -174,11 +174,11 @@
       ],
       "exploit": {
         "url": "https://github.com/dotheboogey678/Root-My-Galaxy-Payloads-SM-S166V/raw/refs/heads/main/artifacts/a16x-S166VUDU7DZE9/cve-2026-43499-app.so",
-        "size": 156408
+        "size": 156000
       },
       "kernelsu": {
         "url": "https://github.com/dotheboogey678/Root-My-Galaxy-Payloads-SM-S166V/raw/refs/heads/main/kernelsu/android13-5.15.189_kernelsu-a16x-S166VUDU7DZE9-kdp",
-        "size": 4765336
+        "size": 379000
       }
     },
     {
