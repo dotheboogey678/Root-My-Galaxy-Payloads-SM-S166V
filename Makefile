@@ -16,6 +16,11 @@ APP_RELEASE := $(OUTDIR)/cve-2026-43499-app.release.so
 APP_RELEASE_SIZE := 104128
 ROOT_HELPER := $(OUTDIR)/cve-2026-43499-root
 
+# Ghost-write targets use slide.c (tracefs KASLR) instead of slide_app.c
+# (pselect/P0 oracle).  Detect the flag directly from the target header.
+TARGET_IS_GHOST := $(shell grep -c 'define SELINUX_GHOST_WRITE[[:space:]]*1' \
+                     $(TARGET_HEADER) 2>/dev/null)
+
 PRELOAD_SRCS := \
   src/main.c \
   src/util.c \
@@ -23,15 +28,23 @@ PRELOAD_SRCS := \
   src/fops.c \
   src/pipe.c \
   src/root.c \
+  src/selinux_ghost.c \
   src/preload.c
+
+ifeq ($(TARGET_IS_GHOST),1)
+APP_SLIDE_SRC := src/slide_app.c
+else
+APP_SLIDE_SRC := src/slide_app.c
+endif
 
 APP_PRELOAD_SRCS := \
   src/main.c \
   src/util.c \
-  src/slide_app.c \
+  $(APP_SLIDE_SRC) \
   src/fops.c \
   src/pipe.c \
   src/root.c \
+  src/selinux_ghost.c \
   src/preload.c
 
 COMMON_CFLAGS := \

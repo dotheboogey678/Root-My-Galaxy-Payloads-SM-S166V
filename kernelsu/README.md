@@ -126,6 +126,20 @@ undefined imports were checked against the recovered A15 `vmlinux`; the KDP,
 DEFEX, syscall-table, and kprobe symbols resolved by name were checked
 separately.
 
+## 5.15.189 (dm3q / a16x)
+
+`android13-5.15.189_kernelsu-dm3q-S9180ZHS8FZF5.ko` and
+`ksud-dm3q-S9180ZHS8FZF5-kdp` cover the S23 Ultra DZF5 release
+(`5.15.189-android13-8-33413713-abS9180ZHS8FZF5`). They are not loadable on
+other 5.15.189 builds.
+
+The Galaxy A16 5G (`SM-S166V`, `a16x-S166VUDU7DZE9`) 5.15.189 pair is
+**pending**: it must be rebuilt for the exact a16x release
+`5.15.189-android13-3-33503169` (exact `vermagic`, empty `__versions` for the
+late loader) from a matching `android13-5.15` Samsung tree. Until then the
+a16x support-feed entry ships the exploit payload only (volatile temporary
+root, no KernelSU).
+
 ## Rebuild
 
 Apply the patch to a clean v3.2.5 checkout:

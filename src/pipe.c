@@ -17,6 +17,22 @@ static int pipe_fds_c[PIPE_C_COUNT][2];
 static int pipe_fds_e[PIPE_E_COUNT][2];
 static int pipe_fds_drain[PIPE_DRAIN][2];
 static int pipe_fds_reclaim[PIPE_RECLAIM][2];
+
+/* Accessors for the ghost-cred root path (selinux_ghost.c): the reclaim pipes'
+ * pipe_buffer arrays live in the page found by prepare_pipe_buffer_page(). */
+int pipe_reclaim_read_fd(int idx) {
+  if (idx < 0 || idx >= PIPE_RECLAIM) {
+    return -1;
+  }
+  return pipe_fds_reclaim[idx][0];
+}
+
+int pipe_reclaim_write_fd(int idx) {
+  if (idx < 0 || idx >= PIPE_RECLAIM) {
+    return -1;
+  }
+  return pipe_fds_reclaim[idx][1];
+}
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
 static int p0_gate_holders[PIPE_RECLAIM][2];
 static int p0_gate_holders_initialized;

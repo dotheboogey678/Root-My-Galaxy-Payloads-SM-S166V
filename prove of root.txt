@@ -1,0 +1,14 @@
+Update just finished compiling kernelsu can  get root now but only around 30% of the time without panicking, proof of root. Im creating the fork now :
+id
+uid=0(root) gid=0(root) groups=0(root) context=kernel
+uname -r
+5.15.189-android13-3-33503169
+getenforce
+Permissive
+head -n 3 /proc/kallsyms
+0000000000000000 T _text
+0000000000000000 t sun4i_handle_irq
+0000000000000000 T _stext
+
+
+

